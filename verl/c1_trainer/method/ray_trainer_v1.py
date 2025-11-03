@@ -444,7 +444,7 @@ class RayPPOTrainer:
         
         if self.config.get("meta_trainer", None).get("scene_generator", None):
             from verl.utils.multi_scene_data.scene_generator import SceneGenerator
-            from verl.utils.multi_scene_data.async_scene_generator_v4 import SceneGeneratorManager
+            from verl.utils.multi_scene_data.async_scene_generator_v5 import SceneGeneratorManager
 
             # self.scene_generator = SceneGenerator(
             #     api_url=self.config.meta_trainer.scene_generator.api_url,
@@ -1476,14 +1476,15 @@ class RayPPOTrainer:
                 batch_requests.append({
                     "original_question": original_question,
                     "previous_aug_questions": previous_aug_questions,
-                    "save_file": save_file
+                    # "save_file": save_file,
+                    # "is_save": True
                 })
             
             try:
                 # 批量生成
                 print(f"[Debug] Attempt: {attempts}, Batch size: {len(batch_requests)}, Target remaining: {remaining_target}")
                 
-                batch_results = self.scene_generator.generate_batch(batch_requests)
+                batch_results = self.scene_generator.generate_batch(batch_requests, save_file=save_file, is_save=True)
                 
                 # 处理批量结果
                 for i, (request_data, variant) in enumerate(zip(batch_requests, batch_results)):

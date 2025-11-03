@@ -25,13 +25,12 @@ from typing import Optional, Dict, List, Any, Union
 from pathlib import Path
 import uuid
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
-from cachetools import LRUCache
-from omegaconf import DictConfig
 from openai.types.chat.chat_completion import ChatCompletion
 from verl.utils.multi_scene_data.utils import _parse_json
 
-from verl.protocol import DataProto
 from verl.utils.multi_scene_data.prompt_constants import MULTI_ROUND_PROMPT_TEMPLATE, MULTI_ROUND_PROMPT_TEMPLATE_EN, PROMPT_TEMPLATE, PROMPT_TEMPLATE_EN
+from datetime import datetime
+
 
 logger = logging.getLogger(__file__)
 
@@ -51,13 +50,7 @@ class SceneGeneratorCallback:
             text = raw_output.strip()
             # 在去除 ```json 后、解析前，加入：
             text = text.replace('\x0c', '\\f').replace('\x08', "\\b")  # 把 form feed 换回 \f
-            # print(text)
-            if text.startswith("```json"):
-                text = text.split("```json", 1)[1].split("```", 1)[0].strip()
-
-            text = self._fix_invalid_json(text)
-            parsed = json.loads(text)
-
+            parsed = _parse_json(text)
             if parsed and "new_question" in parsed and "solution" in parsed:
                 return {
                     "question": parsed["new_question"],
@@ -71,12 +64,12 @@ class SceneGeneratorCallback:
             logger.warning(f"JSON parse failed: {e}")
             return None
 
-    def _fix_invalid_json(self, text: str) -> str:
-        import re
-        def repl(match):
-            prefix, bad_char = match.group(1), match.group(2)
-            return prefix + ("\\" + bad_char if len(prefix) % 2 == 1 else bad_char)
-        return re.sub(r'(\\+)(?!["\\/bfnrtu])(.?)', repl, text)
+    # def _fix_invalid_json(self, text: str) -> str:
+    #     import re
+    #     def repl(match):
+    #         prefix, bad_char = match.group(1), match.group(2)
+    #         return prefix + ("\\" + bad_char if len(prefix) % 2 == 1 else bad_char)
+    #     return re.sub(r'(\\+)(?!["\\/bfnrtu])(.?)', repl, text)
 
     def __call__(self, messages: list[dict[str, str]], completions: ChatCompletion, info: dict[str, Any]):
         """生成完成后调用，执行保存等操作"""
@@ -102,11 +95,14 @@ class SceneGeneratorCallback:
             save_path = Path(save_file)
             save_path.parent.mkdir(parents=True, exist_ok=True)
 
+            info.update({
+                "time": datetime.now().strftime('%Y%m%d_%H%M%S')
+            })
             record = {
                 "messages": messages,
                 "raw_output": raw_output,
                 "parsed_output": parsed_output,
-                "info": {k: v for k, v in info.items() if not "save" in k},
+                "info": {k: v for k, v in info.items() if not "save" in k and not k.startswith("__")},
             }
 
             with save_path.open("a", encoding="utf-8") as f:
@@ -422,7 +418,7 @@ class SceneGeneratorManager:
 if __name__ == "__main__":
     manager = SceneGeneratorManager(
         model_name="qwen3-235b-a22b",
-        api_urls=["http://172.31.128.29:8001/v1/chat/completions"],
+        api_urls=["http://172.31.215.100:8001/v1/chat/completions"],
         api_keys=["fake-key"]
     )
 
@@ -445,6 +441,6 @@ if __name__ == "__main__":
         {"original_question": "How to calculate distance?", "previous_aug_questions": []},
         {"original_question": "What is 2+2?", "previous_aug_questions": []},
     ]
-    results = manager.generate_batch(prompt_contexts)
+    results = manager.generate_batch(prompt_contexts, save_file="./test.jsonl", is_save=True)
     print(f"final result: \n{results}")
 
