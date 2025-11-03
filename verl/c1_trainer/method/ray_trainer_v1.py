@@ -444,13 +444,21 @@ class RayPPOTrainer:
         
         if self.config.get("meta_trainer", None).get("scene_generator", None):
             from verl.utils.multi_scene_data.scene_generator import SceneGenerator
+            from verl.utils.multi_scene_data.async_scene_generator_v4 import SceneGeneratorManager
 
-            self.scene_generator = SceneGenerator(
-                api_url=self.config.meta_trainer.scene_generator.api_url,
-                api_key=self.config.meta_trainer.scene_generator.api_key,
+            # self.scene_generator = SceneGenerator(
+            #     api_url=self.config.meta_trainer.scene_generator.api_url,
+            #     api_key=self.config.meta_trainer.scene_generator.api_key,
+            #     model_name=self.config.meta_trainer.scene_generator.model_name,
+            #     timeout=180
+            #     # scenes=self.config.scene_generator.get("scenes", ["地理", "医学", "金融", "农业", "日常生活", "税务"]),
+            # )
+
+            self.scene_generator = SceneGeneratorManager(
                 model_name=self.config.meta_trainer.scene_generator.model_name,
+                api_urls=[self.config.meta_trainer.scene_generator.api_url],
+                api_keys=[self.config.meta_trainer.scene_generator.api_key],
                 timeout=180
-                # scenes=self.config.scene_generator.get("scenes", ["地理", "医学", "金融", "农业", "日常生活", "税务"]),
             )
         else:
             self.scene_generator = None
@@ -1376,7 +1384,7 @@ class RayPPOTrainer:
                 data_entries.append(data)
         return data_entries
     
-    def _generate_augdata_until_target_size(self, tobe_aug_batch: DataProto, target_size: int, history_question2variants: dict[str, list]={}, save_file:str="") -> list[dict]:
+    def _generate_augdata_until_target_size_sync(self, tobe_aug_batch: DataProto, target_size: int, history_question2variants: dict[str, list]={}, save_file:str="") -> list[dict]:
         """Use external scene generator to generate multi-scene data.
 
         Args:
@@ -1406,7 +1414,7 @@ class RayPPOTrainer:
                 try:
                     if original_question not in history_question2variants:
                         history_question2variants[original_question] = []
-                    
+                    print(f"[Debug] Attempt: {attempts}, Generating for: {original_question[:100]}")
                     variant = self.scene_generator.generate_and_save(
                             original_question=original_question,
                             previous_aug_questions=history_question2variants[original_question],
@@ -1428,6 +1436,85 @@ class RayPPOTrainer:
         
         return aug_data_list, history_question2variants
     
+    def _generate_augdata_until_target_size(self, tobe_aug_batch: DataProto, target_size: int, history_question2variants: dict[str, list]=defaultdict[list], save_file: str="") -> tuple[list[dict], dict]:
+        """Use external scene generator to generate multi-scene data in batches.
+
+        Args:
+            tobe_aug_batch (DataProto): Batch of prompts to be augmented.
+            target_size (int): Target number of augmented samples.
+            history_question2variants (dict): History of generated variants for each original question.
+            save_file (str): File to save raw outputs.
+        Returns:
+            tuple[list[dict], dict]: (aug_data_list, updated_history_question2variants)
+        """
+        aug_data_list = []
+        remaining_target = target_size
+
+        if self.scene_generator is None:
+            raise ValueError("scene_generator_manager is required for meta-training but not initialized.")
+
+        attempts = 0
+        max_attempts = target_size * 2  # 防止死循环
+        
+        # 将 tobe_aug_batch 转换为可迭代的列表
+        batch_items = list(tobe_aug_batch)  # 假设 tobe_aug_batch 可迭代
+        
+        while len(aug_data_list) < target_size and attempts < max_attempts:
+            # 计算当前批次需要生成的数量
+            current_batch_size = min(remaining_target, len(batch_items))
+            
+            # 构建批量请求数据
+            batch_requests = []
+            for i in range(current_batch_size):
+                data_item = batch_items[i + attempts % len(batch_items)]  # 循环使用batch中的数据
+                original_question_key = "problem"
+                original_question = data_item.non_tensor_batch[original_question_key]
+                
+                # 获取历史变体
+                previous_aug_questions = history_question2variants.get(original_question, [])
+                
+                batch_requests.append({
+                    "original_question": original_question,
+                    "previous_aug_questions": previous_aug_questions,
+                    "save_file": save_file
+                })
+            
+            try:
+                # 批量生成
+                print(f"[Debug] Attempt: {attempts}, Batch size: {len(batch_requests)}, Target remaining: {remaining_target}")
+                
+                batch_results = self.scene_generator.generate_batch(batch_requests)
+                
+                # 处理批量结果
+                for i, (request_data, variant) in enumerate(zip(batch_requests, batch_results)):
+                    if len(aug_data_list) >= target_size:
+                        break
+                        
+                    original_question = request_data["original_question"]
+                    
+                    if variant:  # 如果生成成功
+                        question_key = "question"
+                        # 更新历史记录
+                        history_question2variants[original_question].append(variant[question_key])
+                        
+                        # 添加到结果列表
+                        aug_data_list.append({
+                            "question": variant[question_key],
+                            "solution": variant["solution"],
+                            "data_source": f"{self.config.meta_trainer.scene_generator.model_name}_generated",
+                        })
+                        
+                        print(f"[Debug] Generated variant {len(aug_data_list)}/{target_size}: {variant[question_key][:50]}...")
+                    
+                    attempts += 1
+                remaining_target = target_size - len(aug_data_list)
+            
+            except Exception as e:
+                print(f"[Warning] Batch generation failed: {e}")
+                pass
+        print(f"[Debug] Final: Generated {len(aug_data_list)} samples, Target: {target_size}")
+        return aug_data_list, history_question2variants
+
     def _convert_to_experted_data_format(self, data: list[dict]) -> list[dict]:
         map_fn = make_map_fn(split="train", question_key="question", answer_key="solution", do_extract_solution=True, reward_fn_extraction_type="boxed")
         formatted_data = []
@@ -1644,7 +1731,7 @@ class RayPPOTrainer:
                 reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
             batch.batch["token_level_scores"] = reward_tensor
 
-            if reward_extra_infos_dict:
+            if reward_extra_infos_dict: # 好像有点多余了
                 batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
             # compute rewards. apply_kl_penalty if available
@@ -2008,8 +2095,8 @@ class RayPPOTrainer:
                     #     break
 
                     # Step 2: 场景增强生成 aug_batch，选出 n_to_augment 个prompt去增强
-                    # n_to_augment = int(np.ceil(2 / 3 * original_size))
-                    n_to_augment = 10
+                    n_to_augment = int(np.ceil(2 / 3 * original_size))
+                    # n_to_augment = 50
                     kept_ori_order_prompt_uids = self._get_tobe_augment_prompt_uids(ori_prompt_uid2metric_mean, n_to_augment)
                     
                     kept_traj_idxs = []
@@ -2018,14 +2105,16 @@ class RayPPOTrainer:
                             kept_traj_idxs.append(idx)
                     
                     tobe_augmented_batch = ori_batch[kept_traj_idxs]
-                    # target_size = self.config.meta_trainer.get("target_aug_batch_size", original_size)
-                    target_size = self.config.meta_trainer.get("target_aug_batch_size", n_to_augment+1)
-                    history_question2variants = {}
-                    generator_raw_output_save_file = f"{self.config.meta_trainer.augment_data_dir}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/qwen3_max_raw_output__{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+                    target_size = self.config.meta_trainer.get("target_aug_batch_size", original_size)
+                    # target_size = self.config.meta_trainer.get("target_aug_batch_size", n_to_augment+1)
+                    history_question2variants = defaultdict(list)
+                    tag_ymd, tag_ymd_hms = datetime.now().strftime('%Y%m%d'), datetime.now().strftime('%Y%m%d_%H%M%S')
+                    generator_raw_output_save_file = f"{self.config.meta_trainer.augment_data_dir}/generator_raw_output/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/{self.config.meta_trainer.scene_generator.model_name}_raw_output_{tag_ymd_hms}.jsonl"
                     aug_data_list, history_question2variants = self._generate_augdata_until_target_size(tobe_augmented_batch, target_size, history_question2variants, generator_raw_output_save_file)
+                    # aug_data_list, history_question2variants = self._generate_augdata_until_target_size_sync(tobe_augmented_batch, target_size, history_question2variants, generator_raw_output_save_file)
 
                     # TODO: save history_question2variants
-                    save_file = f"{self.config.meta_trainer.augment_history_dir}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+                    save_file = f"{self.config.meta_trainer.augment_history_dir}/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
                     # TODO: 写一个通用的保存字典到文件的函数
                     self._save_dict_to_json(history_question2variants, save_file)
                     # with open(save_file, "w", encoding="utf-8") as f:
@@ -2036,7 +2125,7 @@ class RayPPOTrainer:
                     #         data.update({f"variant_{i}": var for i, var in enumerate(variants)})
                     #     f.write(json.dumps(data, ensure_ascii=False)+"\n")
 
-                    print(f"[Meta-Train] Generated {len(aug_data_list)} augmented samples.")
+                    print(f"[Augmentation End] Generated {len(aug_data_list)} augmented samples.")
                     
                     # if not aug_data_list:
                     #     print("[Meta-Train] No valid augmented samples. Falling back to original batch.")
@@ -2045,7 +2134,7 @@ class RayPPOTrainer:
 
                     # 保存
                     converted_aug_data_list = self._convert_to_experted_data_format(aug_data_list)
-                    aug_data_save_dir = f"{self.config.meta_trainer.augment_data_dir}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
+                    aug_data_save_dir = f"{self.config.meta_trainer.augment_data_dir}/parsed_and_converted_data/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
                     parquet_path = self._save_data_to_jsonl_and_parquet(converted_aug_data_list, aug_data_save_dir)
 
                     aug_dataloader = self._create_temp_dataloader_from_path(parquet_path, len(converted_aug_data_list))
@@ -2081,7 +2170,7 @@ class RayPPOTrainer:
                             chosen_traj_idxs.append(idx)
                     train_batch = concat_batch[chosen_traj_idxs]
                     
-                    if non_zero_cnt < train_bsz:
+                    if non_zero_cnt < train_bsz: # 248 vs 256
                         if train_bsz - non_zero_cnt <= train_bsz // 4:
                             # 从 chosen_prompt_uids 中采样
                             # additional_prompt_uids = [chosen_prompt_uids[random.randint(0, len(chosen_prompt_uids))] for _ in range(train_bsz - non_zero_cnt)]
@@ -2105,15 +2194,18 @@ class RayPPOTrainer:
                     train_batch.non_tensor_batch["uid"] = np.repeat(new_uids, repeat_times, axis=0)
 
                     # dump actual training data
-                    train_data_output_path = f"{self.config.meta_trainer.training_data_dir}/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+                    train_data_output_path = f"{self.config.meta_trainer.training_data_dir}/{tag_ymd}/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
                     self._save_dataproto_to_jsonl(train_batch, train_data_output_path, one_id_saved_once=True)
 
 
                     # Step 4: 训练，是否要循环进行？
-            #         metrics = self._standard_ppo_step(new_batch, metrics, timing_raw, True)
+                    # metrics = self._standard_ppo_step(train_batch, metrics, timing_raw, True)
+                    # print(metrics)
+
+                    # Step 5: 训练后评估，早停判断
 
             #     # 继续外层循环
-            #     self.global_steps += 1
+                self.global_steps += 1
 
             #     # validate
             #     if (
