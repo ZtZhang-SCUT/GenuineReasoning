@@ -1,10 +1,11 @@
 from verl.utils.reward_score.math import remove_boxed, last_boxed_only_string
+from verl.utils.reward_score.aug_gsm8k import extract_answer_between_boxed
 import numpy as np
 from scipy.optimize import fsolve
 
 
 def extract_solution(solution_str):
-    return remove_boxed(last_boxed_only_string(solution_str))
+    return extract_answer_between_boxed(solution_str, use_last_number=True)
 
 instruction_following = "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. User: {}\nAssistant: <think>"
 boxed_instruction = "{}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
