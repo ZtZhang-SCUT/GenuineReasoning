@@ -1887,6 +1887,19 @@ class RayPPOTrainer:
                 indent=indent,
             )
 
+    def _is_early_exit(self, metric: float, threshold: float, mode: str="bigger") -> bool:
+        if mode == "bigger":
+            if metric >= threshold:
+                return True
+            return False
+        elif mode == "smaller":
+            if metric <= threshold:
+                return True
+            return False
+        else:
+            raise ValueError(f"Unknown compare mode, expected 'bigger' or 'smaller', but got '{mode}'")
+
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1933,30 +1946,20 @@ class RayPPOTrainer:
         for epoch in range(self.config.trainer.total_epochs):
             for batch_idx, batch_dict in enumerate(self.train_dataloader):
                 """
-                    for t = 0, ..., T training iterations:
-                        在ori_batch上rollout，筛出模型答对和答错的样本
-                        while do:
-                            思路1：只针对答错的样本生成跨场景问题，直到aug_batch达到目标大小
-                            for each sample in wrong_samples:
-                                生成同等难度的跨场景问题；
-                                if 通过有效性检查: 追加到aug_batch中
-                                if len(aug_batch) >= target_batch_size: break
-                            或
-                            思路2：针对答对和答错的样本分别生成跨场景问题，直到aug_batch达到目标大小
-                            for each sample in [right_samples, wrong_samples]:
-                                针对答对的样本，生成更难的跨场景问题；
-                                针对答错的样本，生成同等难度的跨场景问题；
-                                if 通过有效性检查: 追加到aug_batch中
-                                if len(aug_batch) >= target_batch_size: break
-                        
-                        提供两种训练策略选择：
-                        策略1：从 ori_batch 和 aug_batch 中分别采样直到固定的batch_size，组成新的训练batch
-                        策略2：直接在aug_batch上训练
-                        
-                        用train_batch进行训练
-                        在ori_batch上验证效果，如果ori_batch上的准确率达到阈值，停止当前batch的训练，进行下一个batch
+                    for t = 0, ..., T repeat iterations:
+                        在ori_batch上rollout(每个样本k次)，统计每个样本的准确率
+                        从ori_batch中选出 至少2/3*train_batch_size（为了覆盖各种难度的样本）
+                            - 筛选准确率从0~0.8的样本进行增强
+                            - 如果不足2/3*train_batch_size，根据准确率降序排序，准确率低的优先增强
+                            - 如果
+                        针对这些样本生成跨场景变体，直到aug_batch达到目标大小(设为train_batch_size)
+                        aug_batch上rollout，统计每个样本的准确率
+                        拼接 ori_batch 和 aug_batch 成 merged_batch，基于每个样本的准确率得到每个样本的采样概率
+                            - 过易的题目概率为0，难度适中偏难的样本概率较高，过难样本样本概率较低
+                        基于每个样本的采样概率，从 merged_batch 中采出 train_batch_size 个样本构成最终的 train_batch
+                        在train_batch上进行训练
+                        早停策略
 
-                        aug_batch 可以先保存成文件，后续可以复用，但是可以不用在下一轮迭代中使用
                 """
                 
                 # print(f"[Debug] key of batch_dict: {list(batch_dict.keys())}") # ['input_ids', 'attention_mask', 'position_ids', 'data_source', 'problem', 'ability', 'reward_model', 'extra_info', 'raw_prompt_ids', 'index', 'tools_kwargs', 'interaction_kwargs']
@@ -1977,8 +1980,6 @@ class RayPPOTrainer:
                     with marked_timer("start_profile", timing_raw):
                         self._start_profiling(do_profile)
                     
-                    is_last_step = self.global_steps >= self.total_training_steps
-
                     with marked_timer("step", timing_raw):
                         ori_batch: DataProto = DataProto.from_single_dict(batch_dict)
                         ori_batch.non_tensor_batch["uid"] = np.array(
@@ -2016,7 +2017,7 @@ class RayPPOTrainer:
                         with marked_timer("generate_scene_data", timing_raw):
                             aug_data_list, history_question2variants = self._generate_augdata_until_target_size(tobe_augmented_batch, target_size, history_question2variants, generator_raw_output_save_file)
                             # aug_data_list, history_question2variants = self._generate_augdata_until_target_size_sync(tobe_augmented_batch, target_size, history_question2variants, generator_raw_output_save_file)
-                        print(f"[generate scene data cost time]: {timing_raw['generate_scene_data']/60} mins")
+                        print(f"[generate scene data cost time] {timing_raw['generate_scene_data']/60} mins")
                         
                         # TODO: save history_question2variants
                         save_file = f"{self.config.meta_trainer.augment_history_dir}/{self.config.trainer.experiment_name}/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
@@ -2094,6 +2095,21 @@ class RayPPOTrainer:
                         metrics = self._standard_ppo_step(train_batch, metrics, timing_raw, True)
                         print(f"metrics after ppo training: {metrics}")
 
+                        overall_mean_acc = acc.mean()  # 提前计算，早停判断，修正总训练步数
+                        exit_threshold = 0.9
+                        is_early_exit = self._is_early_exit(overall_mean_acc, exit_threshold)
+                        if is_early_exit:
+                            print(f"Early stopping at step {self.global_steps} for batch {batch_idx}")
+                            namespace = "loop_repeat"
+                            loop_metrics = {
+                                f"{namespace}/early_stop_at_step": outer_loop_idx,
+                            }
+                            logger.log(data=loop_metrics, step=self.global_steps)
+                            # 如果outer_loop_repeat=3, 在outer_loop_index=0时就退出，这时候总的训练步数应该减少2
+                            self.total_training_steps -= (self.config.meta_trainer.get("outer_loop_repeat", 1) - outer_loop_idx - 1)
+
+                        is_last_step = self.global_steps >= self.total_training_steps
+
                         # validate
                         if (
                             self.val_reward_fn is not None
@@ -2153,9 +2169,9 @@ class RayPPOTrainer:
                         self.train_dataloader.sampler.update(batch=train_batch)
 
                     # 记录 oribatch、aug_batch、train_batch 的相关指标
-                    overall_mean_acc = acc.mean() 
                     ari_mean_acc = np.mean(list(ori_prompt_uid2metric_mean.values()))
                     aug_mean_acc = np.mean(list(aug_prompt_uid2metric_mean.values()))
+
                     # 添加以下统计量
                     # 1. 当前 train_batch 中完全 k 次尝试完全正确 或 完全错误的统计
                     train_prompt_uid2metric_vals = defaultdict(list)
@@ -2192,7 +2208,6 @@ class RayPPOTrainer:
                     print(f"Final metrics to log: {metrics}")
                     logger.log(data=metrics, step=self.global_steps)
                     
-                    
                     progress_bar.update(1)
                     self.global_steps += 1
 
@@ -2208,12 +2223,11 @@ class RayPPOTrainer:
                         self.train_dataset.on_batch_end(batch=train_batch)
                     
                     # Step 5: 早停判断，先用上一步的结果进行判断
-                    if overall_mean_acc >= 0.9: # 如果整体准确率大于0.9，则跳出外层
+                    if is_early_exit: # 如果整体准确率大于0.9，则跳出外层
                         # TODO，记录提前退出事件
-                        print(f"")
-                        namespace = "loop_repeat"
-                        loop_metrics = {
-                            f"{namespace}/early_stop_at_step": outer_loop_idx,
-                        }
-                        logger.log(data=loop_metrics, step=self.global_steps)
-                        break  # 退出 outer_loop_repeat
+                        # print(f"Early stopping at step {self.global_steps-1} for batch {batch_idx}")
+                        # loop_metrics = {
+                        #     f"{namespace}/early_stop_at_step": outer_loop_idx,
+                        # }
+                        # logger.log(data=loop_metrics, step=self.global_steps-1) # 注意：此时 global_steps 已 +1，日志用上一步的 step
+                        break  # 退出 outer_loop_repeat，继续下一个 batch
