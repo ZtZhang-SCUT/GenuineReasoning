@@ -25,6 +25,7 @@ from omegaconf import OmegaConf
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.c1_trainer.method.ray_trainer_v1 import RayPPOTrainer
+from verl.c1_trainer.method.ray_trainer_baseline import RayPPOTrainer as BaselineRayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
@@ -105,7 +106,7 @@ class TaskRunner:
         from omegaconf import OmegaConf
 
         from verl.utils.fs import copy_to_local
-        breakpoint()
+        # breakpoint()
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
@@ -166,7 +167,12 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        from verl.c1_trainer.method.ray_trainer_v1 import ResourcePoolManager, Role   # 一定要导入自定义的Role，不然会匹配不上
+        if config.exp.setting == "run_ours":
+            from verl.c1_trainer.method.ray_trainer_v1 import ResourcePoolManager, Role   # 一定要导入自定义的Role，不然会匹配不上
+        elif config.exp.setting == "run_vanilla_grpo_baseline":
+            from verl.c1_trainer.method.ray_trainer_baseline import ResourcePoolManager, Role
+        else:
+            raise ValueError(f"Unsupported config.exp.setting, got '{config.exp.setting}'")
 
         # Map roles to their corresponding remote worker classes.
         role_worker_mapping = {
@@ -222,8 +228,15 @@ class TaskRunner:
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
+        if config.exp.setting == "run_ours":
+            trainer_cls = RayPPOTrainer
+        elif config.exp.setting == "run_vanilla_grpo_baseline":
+            trainer_cls = BaselineRayPPOTrainer
+        else:
+            raise ValueError(f"Unsupported config.exp.setting, got '{config.exp.setting}'")        
+        
         # Initialize the PPO trainer.
-        trainer = RayPPOTrainer(
+        trainer = trainer_cls(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
