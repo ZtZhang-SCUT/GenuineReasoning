@@ -177,6 +177,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["num_turns/max"] = num_turns.max()
         metrics["num_turns/mean"] = num_turns.mean()
 
+    # acc, add by zzt 1106
+    if "acc" in batch.non_tensor_batch:
+        acc = batch.non_tensor_batch["acc"]
+        metrics["critic/acc/mean"] = acc.mean()
+        
     return metrics
 
 
@@ -392,7 +397,7 @@ def process_validation_metrics(
     for data_source, prompt2var2vals in data_src2prompt2var2vals.items():
         for prompt, var2vals in prompt2var2vals.items():
             for var_name, var_vals in var2vals.items():
-                if isinstance(var_vals[0], str):
+                if isinstance(var_vals[0], str) or any(val is None for val in var_vals):
                     continue
 
                 metric = {}
@@ -444,3 +449,16 @@ def process_validation_metrics(
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(prompt_vals)
 
     return data_src2var2metric2val
+
+if __name__ == "__main__":
+    data_sources = ["source1", "source1", "source1", "source1"]
+    sample_inputs = ["prompt1", "prompt1", "prompt2", "prompt3"]
+    infos_dict = {"score": [0.8, 0.9, 0.7, 0.5], "pred": ["A", "A", "B", "c"]}
+    data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, infos_dict)
+    for data_source, var2metric2val in data_src2var2metric2val.items():
+        print(f"data_source: {data_source}")
+        for var_name, metric2val in var2metric2val.items():
+            print(f"    var_name: {var_name}")
+            for metric_name, metric_val in metric2val.items():
+                print(f"        metric_name: {metric_name}")
+                print(f"            metric_val: {metric_val}")

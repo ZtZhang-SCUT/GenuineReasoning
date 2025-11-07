@@ -1465,7 +1465,7 @@ class RayPPOTrainer:
         return parquet_path
 
 
-    def _create_temp_dataloader_from_path(self, generated_data_path: str, batch_size: int):
+    def _create_temp_dataloader_from_path(self, generated_data_path: str, batch_size: int=None):
         from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
         from verl.utils.dataset.rl_dataset import RLHFDataset
         from torch.utils.data import SequentialSampler, DataLoader
@@ -1487,7 +1487,7 @@ class RayPPOTrainer:
         dataloader = DataLoader(
             dataset=dataset,
             # batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-            batch_size=batch_size,
+            batch_size=batch_size if batch_size else len(dataset),
             num_workers=num_workers,
             drop_last=True,
             collate_fn=default_collate_fn,
@@ -1951,7 +1951,7 @@ class RayPPOTrainer:
                         从ori_batch中选出 至少2/3*train_batch_size（为了覆盖各种难度的样本）
                             - 筛选准确率从0~0.8的样本进行增强
                             - 如果不足2/3*train_batch_size，根据准确率降序排序，准确率低的优先增强
-                            - 如果
+                            - 如果超过，则保留
                         针对这些样本生成跨场景变体，直到aug_batch达到目标大小(设为train_batch_size)
                         aug_batch上rollout，统计每个样本的准确率
                         拼接 ori_batch 和 aug_batch 成 merged_batch，基于每个样本的准确率得到每个样本的采样概率
@@ -1959,7 +1959,6 @@ class RayPPOTrainer:
                         基于每个样本的采样概率，从 merged_batch 中采出 train_batch_size 个样本构成最终的 train_batch
                         在train_batch上进行训练
                         早停策略
-
                 """
                 
                 # print(f"[Debug] key of batch_dict: {list(batch_dict.keys())}") # ['input_ids', 'attention_mask', 'position_ids', 'data_source', 'problem', 'ability', 'reward_model', 'extra_info', 'raw_prompt_ids', 'index', 'tools_kwargs', 'interaction_kwargs']
@@ -2012,7 +2011,8 @@ class RayPPOTrainer:
                         target_size = self.config.meta_trainer.get("target_aug_batch_size", original_size)
                         # target_size = self.config.meta_trainer.get("target_aug_batch_size", n_to_augment+1)
                         tag_ymd, tag_ymd_hms = datetime.now().strftime('%Y%m%d'), datetime.now().strftime('%Y%m%d_%H%M%S')
-                        generator_raw_output_save_file = f"{self.config.meta_trainer.augment_data_dir}/{self.config.trainer.experiment_name}/generator_raw_output/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/{self.config.meta_trainer.scene_generator.model_name}_raw_output_{tag_ymd_hms}.jsonl"
+                        # generator_raw_output_save_file = f"{self.config.meta_trainer.augment_data_dir}/{self.config.trainer.experiment_name}/generator_raw_output/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/{self.config.meta_trainer.scene_generator.model_name}_raw_output_{tag_ymd_hms}.jsonl"
+                        generator_raw_output_save_file = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/generator_raw_output/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/{self.config.meta_trainer.scene_generator.model_name}_raw_output_{tag_ymd_hms}.jsonl"
                         
                         with marked_timer("generate_scene_data", timing_raw):
                             aug_data_list, history_question2variants = self._generate_augdata_until_target_size(tobe_augmented_batch, target_size, history_question2variants, generator_raw_output_save_file)
@@ -2020,14 +2020,15 @@ class RayPPOTrainer:
                         print(f"[generate scene data cost time] {timing_raw['generate_scene_data']/60} mins")
                         
                         # TODO: save history_question2variants
-                        save_file = f"{self.config.meta_trainer.augment_history_dir}/{self.config.trainer.experiment_name}/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
+                        save_file = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_history/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
                         # TODO: 写一个通用的保存字典到文件的函数
                         self._save_dict_to_json(history_question2variants, save_file)
                         print(f"[Augmentation End] Generated {len(aug_data_list)} augmented samples.")
                         
                         # 保存
                         converted_aug_data_list = self._convert_to_experted_data_format(aug_data_list)
-                        aug_data_save_dir = f"{self.config.meta_trainer.augment_data_dir}/{self.config.trainer.experiment_name}/parsed_and_converted_data/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
+                        # aug_data_save_dir = f"{self.config.meta_trainer.augment_data_dir}/{self.config.trainer.experiment_name}/parsed_and_converted_data/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
+                        aug_data_save_dir = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/parsed_and_converted_data/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
                         parquet_path = self._save_data_to_jsonl_and_parquet(converted_aug_data_list, aug_data_save_dir)
 
                         aug_dataloader = self._create_temp_dataloader_from_path(parquet_path, len(converted_aug_data_list))
@@ -2087,7 +2088,8 @@ class RayPPOTrainer:
                         train_batch.non_tensor_batch["uid"] = np.repeat(new_uids, repeat_times, axis=0)
 
                         # dump actual training data
-                        train_data_output_path = f"{self.config.meta_trainer.training_data_dir}/{self.config.trainer.experiment_name}/{tag_ymd}/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
+                        # train_data_output_path = f"{self.config.meta_trainer.training_data_dir}/{self.config.trainer.experiment_name}/{tag_ymd}/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
+                        train_data_output_path = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/actual_training_data/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
                         self._save_dataproto_to_jsonl(train_batch, train_data_output_path, one_id_saved_once=True)
 
 
@@ -2096,7 +2098,7 @@ class RayPPOTrainer:
                         print(f"metrics after ppo training: {metrics}")
 
                         overall_mean_acc = acc.mean()  # 提前计算，早停判断，修正总训练步数
-                        exit_threshold = 0.9
+                        exit_threshold = self.config.meta_trainer.acc_threshold
                         is_early_exit = self._is_early_exit(overall_mean_acc, exit_threshold)
                         if is_early_exit:
                             print(f"Early stopping at step {self.global_steps} for batch {batch_idx}")
@@ -2173,7 +2175,7 @@ class RayPPOTrainer:
                     aug_mean_acc = np.mean(list(aug_prompt_uid2metric_mean.values()))
 
                     # 添加以下统计量
-                    # 1. 当前 train_batch 中完全 k 次尝试完全正确 或 完全错误的统计
+                    # 1. 当前 train_batch 中每个问题 k 次尝试回答完全正确 或 完全错误的统计
                     train_prompt_uid2metric_vals = defaultdict(list)
                     for uid, metric_val in zip(
                         train_batch.non_tensor_batch["uid"], train_batch.non_tensor_batch["acc"], strict=True
@@ -2182,8 +2184,8 @@ class RayPPOTrainer:
                     prompt_uid2_metric_mean = {}
                     for prompt_uid, metric_vals in train_prompt_uid2metric_vals.items():
                         prompt_uid2_metric_mean[prompt_uid] = np.mean(metric_vals)
-                    all_right = np.mean(list(prompt_uid2_metric_mean.values())==1.0)
-                    all_wrong = np.mean(list(prompt_uid2_metric_mean.values())==0.0)
+                    all_right = np.mean([metric_mean==1.0 for metric_mean in prompt_uid2_metric_mean.values()])
+                    all_wrong = np.mean([metric_mean==0.0 for metric_mean in prompt_uid2_metric_mean.values()])
                     # 2. 当前 train_batch 中来自 ori_batch 和 aug_batch 的样本分别有多少
                     data_source_lst = train_batch.non_tensor_batch["data_source"]
                     from_aug_proportion = np.mean(["generated" in data_source for data_source in data_source_lst])
