@@ -109,8 +109,8 @@ def default_compute_score(
     elif data_source in [
         "my_gsm8k",
     ] or "generated" in data_source:
-        from . import math_dapo
-        res = math_dapo.compute_score(solution_str, ground_truth, strict_box_verify=True)
+        from . import aug_gsm8k
+        res = aug_gsm8k.compute_score(solution_str, ground_truth, strict_box_verify=True)
     
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
