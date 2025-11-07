@@ -2,9 +2,11 @@ import json
 import time
 import requests
 from typing import List, Dict, Optional, Tuple
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 from verl.utils.multi_scene_data.process_data import make_map_fn
 import os
+from numpy import random
+import re
 
 # ==============================
 # Scene Generator Class
@@ -17,33 +19,32 @@ import os
 
 
 # 非填充用的 {} 转义为 {{}}
-PROMPT_TEMPLATE = """
-你是一个专业的问题生成器，以下是一个学生当前无法答对的问题：
-原始问题：{original_question}
-请先分析该题涉及到的知识点以及该问题的上下文是属于什么场景，然后将这些知识点迁移到一个全新且复杂的现实场景中，例如：税务、农业、医学、化学、地理等，生成一个新的问题。新的问题必须满足以下要求：
-1. 新问题必须涉及与原问题相同的数学结构，但场景必须完全不同；
-2. 新问题的难度应适度增加，确保问题有明确、唯一的正确答案；
-3. 新问题必须附带完整的解答过程，确保最终答案能通过latex解析。
-请以JSON格式输出：
-```json
-{{
-"new_question":  把新问题放在这里, 
-"solution": 把解题过程和最终答案放在这里,
-"explanation": 说明为什么这么设计问题
-}}
-```
-"""
+# PROMPT_TEMPLATE = """
+# 你是一个专业的问题生成器，以下是一个学生当前无法答对的问题：
+# 原始问题：{original_question}
+# 请先分析该题涉及到的知识点以及该问题的上下文是属于什么场景，然后将这些知识点迁移到一个全新且复杂的现实场景中，例如：{shuffle_scenarios}等，生成一个新的问题。新的问题必须满足以下要求：
+# 1. 新问题必须涉及与原问题相同的数学结构，但场景必须完全不同；
+# 2. 新问题的难度应适度增加，确保问题有明确、唯一的正确答案；
+# 3. 新问题必须附带完整的解答过程，确保最终答案能通过latex解析。
+# 请以JSON格式输出：
+# ```json
+# {{
+# "new_question":  把新问题放在这里, 
+# "solution": 把解题过程和最终答案放在这里,
+# "explanation": 说明为什么这么设计问题
+# }}
+# ```
+# """
 
 
 PROMPT_TEMPLATE = """
 # 问题生成任务指令
 你是一个专业的问题生成器，给定学生未正确解答的原始问题，执行以下流程生成新问题：
 1. 知识点与场景解析：提取原始问题的核心数学知识点及其所属场景（上下文）；
-2. 场景迁移与复杂度提升：将提取的知识点迁移至全新复杂现实场景（如税务、农业、医疗、化学、地理等），确保场景与原始问题无关联；
+2. 场景迁移：将提取的知识点迁移至全新复杂现实场景，确保场景与原始问题无关联；
 3. 新问题构建：严格遵循以下约束条件：
    - 数学结构一致性：保留原始问题的核心数学逻辑（如公式形式、推理框架、求解步骤）；
-   - 难度适度增强：通过增加现实场景约束条件提升难度，确保答案唯一且明确；
-   - 解答完整性：配套完整解题过程，关键数学表达式需兼容LaTeX解析规范，并把最终的答案放在 \\boxed() 中。
+   - 解答完整性：需附带含LaTeX格式的详细解题步骤，确保最终答案唯一，并把最终的答案放在 \\boxed() 中。
 
 # 输出要求
 仅以JSON格式返回以下字段（嵌入```json代码块中，无额外文本）：
@@ -96,6 +97,34 @@ def format_previous_aug(previous_aug_questions):
         formatted.append(f"{i}. {aug_question}")
     return "\n".join(formatted)
 
+SCENARIOS = ["税务", "农业", "医学", "化学", "地理", "金融"]
+def shuffle_scenarios():
+    random.shuffle(SCENARIOS)
+    return "、".join(SCENARIOS)
+
+def fix_invalid_backslashes(s: str) -> str:
+    """
+    修复非法 JSON 转义字符：
+    - 仅当 \ 后不是合法 JSON 转义字符时修复；
+    - 若该反斜杠前已有偶数个反斜杠（已被正确转义）则不修复；
+    - 仅在奇数个反斜杠结尾时修复为双反斜杠。
+    """
+
+    def repl(match):
+        prefix = match.group(1)
+        bad_char = match.group(2)
+        # 计算反斜杠数量
+        backslash_count = len(prefix)
+        # 如果是偶数个反斜杠，说明上一个反斜杠已经被转义，不修复
+        if backslash_count % 2 == 0:
+            return prefix + bad_char
+        # 如果是奇数个反斜杠，说明这是非法转义 -> 加倍
+        return prefix + "\\" + bad_char
+
+    # 匹配：连续反斜杠 + 一个非合法转义字符
+    pattern = r'(\\+)(?!["\\/bfnrtu])(.?)'
+    return re.sub(pattern, repl, s)
+
 class SceneGenerator:
     def __init__(
         self,
@@ -133,13 +162,13 @@ class SceneGenerator:
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.8,  # 增加随机性
+            # "temperature": 0.8,  # 增加随机性
             # "max_tokens": 512,
         }
         response = requests.post(
             self.api_url, headers=headers, json=payload, timeout=self.timeout
         )
-        response.raise_for_status()
+        response.raise_for_status() # raise HTTPError, if one occur
         result = response.json()
         # 根据实际 API 调整字段，以下为通用格式
         return result["choices"][0]["message"]["content"].strip()
@@ -150,7 +179,8 @@ class SceneGenerator:
             # 移除 ```json ... ``` 包裹
             if text.startswith("```json"):
                 text = text.split("```json")[1].split("```")[0].strip()
-            return json.loads(text, strict=False) # text 中可能包含 \n, \r, tab键等特殊字符，导致json解析失败，添加strict=False可避免
+            text = fix_invalid_backslashes(text)
+            return json.loads(text)
         except (json.JSONDecodeError, IndexError):
             return None
         
@@ -219,6 +249,7 @@ class SceneGenerator:
         
         else:
             return PROMPT_TEMPLATE.format(
+                scenarios = shuffle_scenarios(),
                 original_question = original_question
             )
        
@@ -258,8 +289,13 @@ class SceneGenerator:
             else:
                 print(f"⚠️ Failed to parse OOD output: {raw_output[:]}")
                 return None
+        except RetryError as e:
+            # 获取最后一次尝试中抛出的原始异常
+            original_exception = e.last_attempt.exception()
+            print(f"❌ API call failed after retrying: {e}. The original exception is: {original_exception}")
+            return None
         except Exception as e:
-            print(f"❌ API call failed for generate_and_save: {e}")
+            print(f"❌ API call failed for generate_and_save. Unexpected error: {e}")
             return None
         
 
@@ -349,7 +385,7 @@ class SceneGenerator:
         generated = []  # 存储历史生成的问题
         for i in range(num_questions):
             
-            new_item = self._generate_single_ood_scene_variant_for_one_question(original_question, generated, i)
+            new_item = self._generate_single_ood_scene_variant_for_one_question(original_question, generated)
             if new_item:
                 generated.append(new_item["question"])
                 print(f"生成第{i+1}个问题：{len(generated)}")
@@ -383,13 +419,15 @@ if __name__ == "__main__":
     generator = SceneGenerator(
         api_url="http://152.136.41.186:30131/v1/chat/completions",
         api_key="sk-kQKMTKyEQA7X6eZ_AR72Cqvb2o7NgskyrKG9UdPqUPD8zu-_HeVs5Nie0_M",
-        model_name="qwen3-max",
+        # model_name="qwen3-max",
+        model_name="gpt-5",
     )
     test_question = "如果一个水池有两个水管，水管A单独注水需要3小时，水管B单独注水需要6小时。那么两个水管一起注水需要多少时间才能注满水池？"
-    generated = generator.generate_with_history(test_question, 3)
-    for idx, var in enumerate(generated):
-        print(f"Variant {idx+1}:")
-        print(f"Question: {var}")
+    generated = generator.generate_and_save(test_question, [], "save_file.jsonl")
+    # generated = generator.generate_with_history(test_question, 3)
+    # for idx, var in enumerate(generated):
+    #     print(f"Variant {idx+1}:")
+    #     print(f"Question: {var}")
     
     # variants = generator.generate_until_reach_target_num(test_question, target_num=1)
     # for idx, var in enumerate(variants):
