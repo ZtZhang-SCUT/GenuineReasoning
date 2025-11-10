@@ -1631,7 +1631,7 @@ class RayPPOTrainer:
         # compute values
         if self.use_critic:
             with marked_timer("values", timing_raw, color="cyan"):
-                values = self.critic_wg.compute_values(batch)
+                values = self.critic_wg.compute_values(batch) # [bs, seq_len] 每个 token (state) 都有一个不同的 value
                 batch = batch.union(values)                
 
         with marked_timer("adv", timing_raw, color="brown"):
@@ -1907,6 +1907,23 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        """
+        for epoch in range(total_epochs):
+            for ori_batch in train_loader:
+                for t = 0, ..., T repeat iterations:
+                    在ori_batch上rollout(每个样本k次)，估计每个样本的准确率
+                    从ori_batch中选出 至少2/3*train_batch_size（为了覆盖各种难度的样本）
+                        - 筛选准确率从0~0.8的样本进行增强
+                        - 如果数量不足2/3*train_batch_size，根据准确率降序排序，再截取2/3*train_batch_size个进行改写（准确率低的优先增强）
+                        - 如果超过2/3*train_batch_size，则保留
+                    针对这些样本生成跨场景变体（每个iterations生成的变体都不一样），直到aug_batch达到目标大小(设为train_batch_size)
+                    aug_batch上rollout，统计每个样本的准确率
+                    拼接 ori_batch 和 aug_batch 成 merged_batch，基于每个样本的准确率得到每个样本的采样概率
+                        - 过易的题目采样概率为0，难度适中偏难的样本概率较高，过难样本样本概率较低
+                    基于每个样本的采样概率，从 merged_batch 中采出 train_batch_size 个样本构成最终的 train_batch
+                    在train_batch上进行强化学习训练
+                    早停策略（模型在当前ori_batch+aug_batch上的准确率达到阈值后退出最内层迭代，转向处理下一个batch）
+        """
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
@@ -1945,22 +1962,6 @@ class RayPPOTrainer:
         history_question2variants = defaultdict(list) # 记录每个问题的历史增强记录（增量式）
         for epoch in range(self.config.trainer.total_epochs):
             for batch_idx, batch_dict in enumerate(self.train_dataloader):
-                """
-                    for t = 0, ..., T repeat iterations:
-                        在ori_batch上rollout(每个样本k次)，统计每个样本的准确率
-                        从ori_batch中选出 至少2/3*train_batch_size（为了覆盖各种难度的样本）
-                            - 筛选准确率从0~0.8的样本进行增强
-                            - 如果不足2/3*train_batch_size，根据准确率降序排序，准确率低的优先增强
-                            - 如果超过，则保留
-                        针对这些样本生成跨场景变体，直到aug_batch达到目标大小(设为train_batch_size)
-                        aug_batch上rollout，统计每个样本的准确率
-                        拼接 ori_batch 和 aug_batch 成 merged_batch，基于每个样本的准确率得到每个样本的采样概率
-                            - 过易的题目概率为0，难度适中偏难的样本概率较高，过难样本样本概率较低
-                        基于每个样本的采样概率，从 merged_batch 中采出 train_batch_size 个样本构成最终的 train_batch
-                        在train_batch上进行训练
-                        早停策略
-                """
-                
                 # print(f"[Debug] key of batch_dict: {list(batch_dict.keys())}") # ['input_ids', 'attention_mask', 'position_ids', 'data_source', 'problem', 'ability', 'reward_model', 'extra_info', 'raw_prompt_ids', 'index', 'tools_kwargs', 'interaction_kwargs']
                 if not self.config.meta_trainer.get("enable", False):
                     # Fallback to standard PPO if meta-training disabled
@@ -2012,7 +2013,8 @@ class RayPPOTrainer:
                         # target_size = self.config.meta_trainer.get("target_aug_batch_size", n_to_augment+1)
                         tag_ymd, tag_ymd_hms = datetime.now().strftime('%Y%m%d'), datetime.now().strftime('%Y%m%d_%H%M%S')
                         # generator_raw_output_save_file = f"{self.config.meta_trainer.augment_data_dir}/{self.config.trainer.experiment_name}/generator_raw_output/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/{self.config.meta_trainer.scene_generator.model_name}_raw_output_{tag_ymd_hms}.jsonl"
-                        generator_raw_output_save_file = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/generator_raw_output/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/{self.config.meta_trainer.scene_generator.model_name}_raw_output_{tag_ymd_hms}.jsonl"
+                        # generator_raw_output_save_file = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/generator_raw_output/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/{self.config.meta_trainer.scene_generator.model_name}_raw_output_{tag_ymd_hms}.jsonl"
+                        generator_raw_output_save_file = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/generator_raw_output/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/{self.config.meta_trainer.scene_generator.model_name}_raw_output_{tag_ymd_hms}.jsonl"
                         
                         with marked_timer("generate_scene_data", timing_raw):
                             aug_data_list, history_question2variants = self._generate_augdata_until_target_size(tobe_augmented_batch, target_size, history_question2variants, generator_raw_output_save_file)
@@ -2020,7 +2022,8 @@ class RayPPOTrainer:
                         print(f"[generate scene data cost time] {timing_raw['generate_scene_data']/60} mins")
                         
                         # TODO: save history_question2variants
-                        save_file = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_history/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
+                        # save_file = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_history/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
+                        save_file = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_history/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
                         # TODO: 写一个通用的保存字典到文件的函数
                         self._save_dict_to_json(history_question2variants, save_file)
                         print(f"[Augmentation End] Generated {len(aug_data_list)} augmented samples.")
@@ -2028,7 +2031,8 @@ class RayPPOTrainer:
                         # 保存
                         converted_aug_data_list = self._convert_to_experted_data_format(aug_data_list)
                         # aug_data_save_dir = f"{self.config.meta_trainer.augment_data_dir}/{self.config.trainer.experiment_name}/parsed_and_converted_data/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
-                        aug_data_save_dir = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/parsed_and_converted_data/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
+                        aug_data_save_dir = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/parsed_and_converted_data/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
+                        # aug_data_save_dir = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/parsed_and_converted_data/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
                         parquet_path = self._save_data_to_jsonl_and_parquet(converted_aug_data_list, aug_data_save_dir)
 
                         aug_dataloader = self._create_temp_dataloader_from_path(parquet_path, len(converted_aug_data_list))
@@ -2089,7 +2093,8 @@ class RayPPOTrainer:
 
                         # dump actual training data
                         # train_data_output_path = f"{self.config.meta_trainer.training_data_dir}/{self.config.trainer.experiment_name}/{tag_ymd}/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
-                        train_data_output_path = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/actual_training_data/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
+                        # train_data_output_path = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/actual_training_data/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
+                        train_data_output_path = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/actual_training_data/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
                         self._save_dataproto_to_jsonl(train_batch, train_data_output_path, one_id_saved_once=True)
 
 
