@@ -62,6 +62,7 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
 import re
+from pathlib import Path
 
 WorkerType = type[Worker]
 
@@ -617,6 +618,12 @@ class RayPPOTrainer:
 
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
+        
+        # 指定总的训练步数为 ours 的训练步数，从训练数据文件夹中子文件的个数来决定
+        if self.config.exp.setting == "run_vanilla_grpo_baseline":
+            data_dir = self.config.exp.vanilla_grpo_baseline.parsed_and_converted_data_saved_dir
+            total_training_steps = self._get_baseline_total_training_steps(data_dir)
+            print(f"RUN VANILLA GRPO BASELINE, TOTAL TRAINING STEPS CHANGED TO {total_training_steps}")
 
         self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
@@ -1130,7 +1137,7 @@ class RayPPOTrainer:
         仅匹配 global_training_step_数字_outer_loop_0。
         """
         # pattern = re.compile(r"^global_training_step_4_outer_loop_0$")
-        pattern = re.compile(rf"global_training_step_{global_step}_outer_loop_0")
+        pattern = re.compile(rf"global_training_step_{global_step}_")
         
         for dirpath, dirnames, filenames in os.walk(root_dir):
             dirname = os.path.basename(dirpath)
@@ -1142,6 +1149,40 @@ class RayPPOTrainer:
                     return os.path.join(dirpath, parquet_files[0])
         # 如果都没找到
         return None
+    
+    def _get_baseline_total_training_steps(self, data_path: str) -> int:
+        path = Path(data_path)
+        num_dirs = sum(1 for f in path.iterdir() if f.is_dir())
+        return num_dirs
+    
+    def _run_vanilla_grpo_baseline(self) -> dict:
+        # 添加对于 aug_batch 的评估，并 log 到 wandb
+        # 1. 加载数据集
+        # 2. 调用_evaluate_current_batch
+        # 3. 统计mean_acc
+        # root_dir = "/workspace/zhangzitian/code/verl/data/training/verl_grpo_my_gsm8k/llama3_1_8b_aug_grpo_1104/augment_data/parsed_and_converted_data"
+        assert self.config.exp.vanilla_grpo_baseline is not None
+        root_dir = self.config.exp.vanilla_grpo_baseline.parsed_and_converted_data_saved_dir
+        aug_batch_path = self._get_parquet_from_dir(root_dir, self.global_steps)
+        if aug_batch_path:
+            aug_dataloader = self._create_temp_dataloader_from_path(aug_batch_path)
+        else:
+            raise RuntimeError(f"Cannot find parquet path for augment batch")
+        aug_batch = DataProto.from_single_dict(next(iter(aug_dataloader)))
+
+        # 评估aug_batch，计算每个prompt的准确率
+        aug_batch.non_tensor_batch["uid"] = np.array(
+            [str(uuid.uuid4()) for _ in range(len(aug_batch.batch))], dtype=object
+        )
+        metric_name = "acc"
+        repeat_times = self.config.actor_rollout_ref.rollout.n
+        new_aug_batch, aug_prompt_uid2metric_mean = self._evaluate_current_batch(aug_batch, repeat_times=repeat_times, metric_name=metric_name)
+        aug_mean_acc = np.mean(list(aug_prompt_uid2metric_mean.values()))
+        loop_metrics = {
+            f"loop_repeat/aug_batch_acc/mean": aug_mean_acc,
+        }
+        # metrics.update(loop_metrics)
+        return loop_metrics
     
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -1547,31 +1588,9 @@ class RayPPOTrainer:
                                 dump_path=rollout_data_dir,
                             )
 
-                    # 添加对于 aug_batch 的评估，并 log 到 wandb
-                    # 1. 加载数据集
-                    # 2. 调用_evaluate_current_batch
-                    # 3. 统计mean_acc
-                    root_dir = "/workspace/zhangzitian/code/verl/data/training/verl_grpo_my_gsm8k/llama3_1_8b_aug_grpo_1104/augment_data/parsed_and_converted_data"
-                    aug_batch_path = self._get_parquet_from_dir(root_dir, self.global_steps)
-                    if aug_batch_path:
-                        aug_dataloader = self._create_temp_dataloader_from_path(aug_batch_path)
-                    else:
-                        raise RuntimeError(f"Cannot find parquet path for augment batch")
-                    aug_batch = DataProto.from_single_dict(next(iter(aug_dataloader)))
-
-                    # 评估aug_batch，计算每个prompt的准确率
-                    aug_batch.non_tensor_batch["uid"] = np.array(
-                        [str(uuid.uuid4()) for _ in range(len(aug_batch.batch))], dtype=object
-                    )
-                    metric_name = "acc"
-                    repeat_times = self.config.actor_rollout_ref.rollout.n
-                    new_aug_batch, aug_prompt_uid2metric_mean = self._evaluate_current_batch(aug_batch, repeat_times=repeat_times, metric_name=metric_name)
-                    aug_mean_acc = np.mean(list(aug_prompt_uid2metric_mean.values()))
-                    namespace = "loop_repeat"
-                    loop_metrics = {
-                        f"{namespace}/aug_batch_acc/mean": aug_mean_acc,
-                    }
-                    metrics.update(loop_metrics)
+                    if self.config.exp.setting == "run_vanilla_grpo_baseline":
+                        baseline_metrics = self._run_vanilla_grpo_baseline()
+                        metrics.update(baseline_metrics)
 
                     # validate
                     if (
