@@ -290,3 +290,42 @@ def local_mkdir_safe(path):
         os.makedirs(path, exist_ok=True)
 
     return path
+
+def safe_copy_to_sharedata(src: str, dst: str):
+    """
+    安全拷贝 src 到 dst：
+    - 如果目标目录已存在，先删除再复制
+    - 使用 copyfile 以避免保留 metadata
+    - 对于共享存储（如 /sharedata）不会触发 Operation not permitted
+    """
+    # 如果目标存在则删除
+    if os.path.exists(dst):
+        print(f"[safe_copy] Removing existing destination: {dst}")
+        shutil.rmtree(dst, ignore_errors=True)
+
+    # 定义内部递归复制函数
+    def _copy(src_path, dst_path):
+        if os.path.isdir(src_path):
+            os.makedirs(dst_path, exist_ok=True)
+            for name in os.listdir(src_path):
+                _copy(os.path.join(src_path, name), os.path.join(dst_path, name))
+        else:
+            # 只复制文件内容，不复制权限元数据
+            shutil.copyfile(src_path, dst_path)
+
+    _copy(src, dst)
+    print(f"[safe_copy] Copy complete: {src} -> {dst}")
+
+
+def fast_safe_copy_to_sharedata(src: str, dst: str):
+    import subprocess
+    if os.path.exists(dst):
+        print(f"Removing existing destination: {dst}")
+        # 检查是否为S3或FUSE挂载
+        if "fuse" in os.popen(f"mount | grep '{dst.split(os.sep)[1]}'").read():
+            # print(f"Detected FUSE/S3 mount, using system rm for speed.")
+            subprocess.run(["rm", "-rf", dst], check=True)
+        else:
+            shutil.rmtree(dst, ignore_errors=True)
+
+    subprocess.run(["cp", "-r", src, dst], check=True)

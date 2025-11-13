@@ -21,7 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
-from collections import defaultdict
+from collections import defaultdict, Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -65,11 +65,13 @@ from verl.utils.tracking import ValidationGenerationsLogger
 WorkerType = type[Worker]
 
 from verl.utils.multi_scene_data.process_data import make_map_fn, ModifiedGaussian
+from verl.utils.fs import fast_safe_copy_to_sharedata, safe_copy_to_sharedata
 from numpy import random
 from typing import Any, Dict, Union, Optional, Callable
 from datetime import datetime
 # from pathlib import Path
-import time
+from glob import glob
+import re
 
 def wrong_rate2sample_probs(map_func: Callable, xs: np.ndarray) -> np.ndarray:
     """
@@ -1131,6 +1133,40 @@ class RayPPOTrainer:
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    def _load_generate_history(self):
+        """
+        恢复历史生成状态
+        要加载history_questions2variants
+        修改self.total_training_steps
+        """
+        history_question2variants = defaultdict(list)
+        if self.config.meta_trainer.resume_mode == "disable":
+            return 0
+
+        history_folder = self.config.meta_trainer.default_history_dir
+        if not os.path.isabs(history_folder):
+            working_dir = os.getcwd()
+            history_folder = os.path.join(working_dir, history_folder)
+        
+        # find last global_step，直接从 self.global_steps 开始就行了
+        # latest_step = find_latest_step(history_folder)
+
+        global_step_path = find_latest_history_path(history_folder, self.global_steps)  # None if no latest
+
+        if self.config.meta_trainer.resume_mode == "auto":
+            if global_step_path is None:
+                print("Can't found corresponding history generation path, training from scratch")
+                return 0
+        else:
+            if self.config.resume_mode == "resume_path":
+                assert isinstance(self.config.meta_trainer.resume_from_path, str)   # 直接指定json文件
+                global_step_path = self.config.meta_trainer.resume_from_path
+                if not os.path.isabs(global_step_path):
+                    working_dir = os.getcwd()
+                    global_step_path = os.path.join(working_dir, global_step_path)
+        
+        print(f"Load from history_question2variants path: {global_step_path}")
+        
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
@@ -1767,10 +1803,11 @@ class RayPPOTrainer:
                 # Optionally add meta_info as top-level fields
                 if include_meta_info and dataproto.meta_info:
                     serial_meta = _make_json_serializable(dataproto.meta_info)
-                    if isinstance(serial_meta, dict):
-                        sample.update(serial_meta)
-                    else:
-                        sample["meta_info"] = serial_meta
+                    # if isinstance(serial_meta, dict):
+                    #     sample.update(serial_meta)
+                    # else:
+                    #     sample["meta_info"] = serial_meta
+                    sample["meta_info"] = serial_meta
 
                 f.write(json.dumps(sample, ensure_ascii=False) + "\n")
                 sample_cnt += 1
@@ -1899,6 +1936,79 @@ class RayPPOTrainer:
         else:
             raise ValueError(f"Unknown compare mode, expected 'bigger' or 'smaller', but got '{mode}'")
 
+    def _restore_training_state_from_history(self, total_training_steps, current_global_step):
+        """
+        自动恢复：
+        1. history_question2variants 字典；
+        2. 根据 augment_history 文件推断 total_training_steps。
+
+        依赖文件命名规则：
+        global_training_step_{step}_outer_loop_{outer_loop}_augment_history_*.jsonl
+        """
+        base_dir = f"{self.config.meta_trainer.base_sharedata_data_dir}/" \
+               f"{self.config.trainer.project_name}/" \
+               f"{self.config.trainer.experiment_name}/augment_history"
+        
+        if not os.path.exists(base_dir):
+            print(f"[Restore] augment_history directory not found: {base_dir}")
+            return defaultdict(list), total_training_steps
+
+        # 1. 匹配文件名中的 step 与 outer_loop
+        pattern = re.compile(r"global_training_step_(\d+)_outer_loop_(\d+)_augment_history_.*\.jsonl$")
+        records = []
+        for file_path in glob(os.path.join(base_dir, "*.jsonl")):
+            m = pattern.search(os.path.basename(file_path))
+            if m:
+                step, outer_loop = int(m.group(1)), int(m.group(2))
+                if step <= current_global_step:  # 过滤掉 record[0] > current_global_step 的记录
+                    records.append((step, outer_loop, file_path))
+
+        if not records:
+            print(f"[Restore] No augment_history files found in {base_dir}")
+            return defaultdict(list), total_training_steps
+
+        # 2. 按 step, outer_loop 排序
+        records.sort(key=lambda x: (x[0], x[1]))
+
+        # 3. 找到当前 step 对应的 history_file
+        history_file = [r[2] for r in records if r[0] == current_global_step][0]
+        print(f"[Restore] Latest augment history file: {history_file}")
+        print(f"[Restore] Latest global_training_step={current_global_step}")
+
+        # 4. 加载最后一个文件中的 history_question2variants
+        history_question2variants = defaultdict(list)
+        try:
+            with open(history_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for q, v in data.items():
+                    history_question2variants[q].extend(v)
+        except Exception as e:
+            print(f"[Restore] Failed to load {history_file}: {e}")
+
+        # 5. 动态调整 total_training_steps
+        # 注意：self.global_steps 已由 _load_checkpoint() 设置为上次 ckpt 对应 step。
+        #      这里我们根据 augment_history 推断上一个 step 的 outer_loop 是否提早结束。
+        repeat_count = self.config.meta_trainer.get("outer_loop_repeat", 1)
+        to_counter = [record[1] for record in records]
+
+        # 假如最后的 outer_loop 不是 repeat_count-1，那么要找到最近的0的前一个，already_escape 重新计算，同时获取 current_outer_loop=最后的outer_loop
+        next_outer_loop = -1
+        if to_counter[-1] != repeat_count-1:  # 说明最后一轮是不完整的
+            next_outer_loop = to_counter[-1] + 1
+            last_0_index = -1 - to_counter[::-1].index(0)
+            to_counter = to_counter[:last_0_index]  # 前面的都是完整的
+        
+        counter = Counter(to_counter)
+        print(f"counter: {counter}, keys: {counter.keys()}")
+
+        reduced_steps = counter[0]*repeat_count - sum(list(counter.values()))
+        old_total = total_training_steps
+        total_training_steps -= reduced_steps
+        print(f"[Restore] Adjust total_training_steps: {old_total} -> {total_training_steps} "
+            f"(reduced {reduced_steps} due to early exit). "
+            f"The outer_loop_index of step {current_global_step+1} should be {next_outer_loop}")
+        
+        return history_question2variants, total_training_steps, next_outer_loop
 
     def fit(self):
         """
@@ -1935,10 +2045,11 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        self.global_steps = 0   # global_step 通常被定义为模型参数更新的总次数
+        self.global_steps = 0   # global_step 通常被定义为截止目前模型参数更新的总次数
 
         # load checkpoint before doing anything
-        self._load_checkpoint()
+        # self._load_checkpoint()
+        self.global_steps = 140
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -1952,14 +2063,16 @@ class RayPPOTrainer:
 
         # add tqdm
         self.total_training_steps *= self.config.meta_trainer.get("outer_loop_repeat", 1)  # 最大训练步数
+        # TODO: 从路径中恢复 history_question2variants
+        history_question2variants = defaultdict(list) # 记录每个问题的历史增强记录（增量式）
+        history_question2variants, self.total_training_steps, next_outer_loop_idx = self._restore_training_state_from_history(self.total_training_steps, self.global_steps)
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
-        self.max_steps_duration = 0  # 完成一个step的耗时
+        self.max_steps_duration = 0  # 完成一个step的最大耗时记录
 
-        history_question2variants = defaultdict(list) # 记录每个问题的历史增强记录（增量式）
         for epoch in range(self.config.trainer.total_epochs):
             for batch_idx, batch_dict in enumerate(self.train_dataloader):
                 # print(f"[Debug] key of batch_dict: {list(batch_dict.keys())}") # ['input_ids', 'attention_mask', 'position_ids', 'data_source', 'problem', 'ability', 'reward_model', 'extra_info', 'raw_prompt_ids', 'index', 'tools_kwargs', 'interaction_kwargs']
@@ -1970,6 +2083,9 @@ class RayPPOTrainer:
 
                 # 对当前的batch循环训练outer_loop_repeat次，直到其准确率达到某个阈值或到最大迭代次数（可提前退出）
                 for outer_loop_idx in range(self.config.meta_trainer.get("outer_loop_repeat", 1)):
+                    if outer_loop_idx < next_outer_loop_idx:
+                        continue
+                    next_outer_loop_idx = -1
                     metrics = {}  # 每个 step 单独的 metrics 统计
                     timing_raw = {}
                     do_profile = (
@@ -2023,12 +2139,13 @@ class RayPPOTrainer:
                         
                         # TODO: save history_question2variants
                         # save_file = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_history/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
-                        save_file = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_history/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
+                        # save_file = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_history/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
+                        save_file = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_history/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.json"
                         # TODO: 写一个通用的保存字典到文件的函数
                         self._save_dict_to_json(history_question2variants, save_file)
                         print(f"[Augmentation End] Generated {len(aug_data_list)} augmented samples.")
                         
-                        # 保存
+                        # 将生成的数据转换成 dataprob 期望的格式并保存成 jsonl 文件（方便查看）和 parquet 文件（方便RLHFDataset接口加载）
                         converted_aug_data_list = self._convert_to_experted_data_format(aug_data_list)
                         # aug_data_save_dir = f"{self.config.meta_trainer.augment_data_dir}/{self.config.trainer.experiment_name}/parsed_and_converted_data/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
                         aug_data_save_dir = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/parsed_and_converted_data/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
@@ -2094,7 +2211,8 @@ class RayPPOTrainer:
                         # dump actual training data
                         # train_data_output_path = f"{self.config.meta_trainer.training_data_dir}/{self.config.trainer.experiment_name}/{tag_ymd}/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
                         # train_data_output_path = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/actual_training_data/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
-                        train_data_output_path = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/actual_training_data/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
+                        # train_data_output_path = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/actual_training_data/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
+                        train_data_output_path = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/actual_training_data/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
                         self._save_dataproto_to_jsonl(train_batch, train_data_output_path, one_id_saved_once=True)
 
 
@@ -2150,6 +2268,10 @@ class RayPPOTrainer:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
+                            with marked_timer("copy_to_sharedata", timing_raw):
+                                tmpworkspace_path = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}"
+                                sharedata_path = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}"
+                                fast_safe_copy_to_sharedata(tmpworkspace_path, sharedata_path)
 
                     with marked_timer("stop_profile", timing_raw):
                         self._stop_profiling(do_profile)
