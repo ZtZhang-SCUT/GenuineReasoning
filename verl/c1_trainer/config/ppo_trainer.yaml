@@ -338,6 +338,8 @@ ray_init:
 
 
 meta_trainer:
+  enable: true
+  resume_mode: disable
 
   scene_generator:
 
@@ -347,9 +349,6 @@ meta_trainer:
 
     # OpenAI API key. If null, will use the environment variable OPENAI_API_KEY.
     api_key: null
-
-    # List of scenes to choose from when rewriting questions.
-    scenes: ["地理", "医学", "金融", "农业", "日常生活", "税务"]
 
     # Maximum number of retries for API calls in case of failure.
     max_retries: 3
@@ -363,4 +362,25 @@ meta_trainer:
     # Maximum number of tokens in the generated output.
     max_tokens: 512
   
-  generated_data_dir: data/generated_scene_data
+  outer_loop_repeat: 1
+
+  inner_max_steps: 3
+
+  acc_threshold: 0.95
+
+  augmentation_strategy: "strategy1"  # or "strategy2"
+  base_workspace_data_dir: /tmpworkspace/zhangzitian/data/training
+  base_sharedata_data_dir: /sharedata/zhangzitian/training_data
+  
+  training_data_dir: data/training/actual_training_data
+
+  augment_data_dir: data/training/augment_data
+
+  generator_data_dir: data/training/generator
+
+  augment_history_dir: data/training/augment_history
+
+exp:
+  setting: "run_ours"
+  vanilla_grpo_baseline:
+    parsed_and_converted_data_saved_dir: null

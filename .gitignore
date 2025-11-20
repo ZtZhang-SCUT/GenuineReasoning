@@ -117,7 +117,7 @@ ENV/
 
 # data
 *.parquet
-
+data/
 
 # local logs
 logs
@@ -129,3 +129,7 @@ outputs
 # my files
 **/val_results/
 **/LeetCodeDataset/
+data/training/
+*.out
+*log*.txt
+verl/c1_trainer/config
