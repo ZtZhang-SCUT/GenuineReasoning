@@ -1728,10 +1728,10 @@ class RayPPOTrainer:
                 key=lambda x: x[1]
             )
             worst_uids = [uid for uid, _ in sorted_prompt_uids_by_metric[:n_to_augment]]
-            filted_kept_ori_order_prompt_uids = [uid for uid in list(uid2metric.keys()) if uid in worst_uids]
+            # filted_kept_ori_order_prompt_uids = [uid for uid in list(uid2metric.keys()) if uid in worst_uids]
+            filted_kept_ori_order_prompt_uids = worst_uids
         return filted_kept_ori_order_prompt_uids
     
-
     def _save_dataproto_to_jsonl(
         self,
         dataproto: "DataProto",
@@ -1911,13 +1911,17 @@ class RayPPOTrainer:
         依赖文件命名规则：
         global_training_step_{step}_outer_loop_{outer_loop}_augment_history_*.jsonl
         """
+
+        if self.config.meta_trainer.resume_mode == "disable":
+            return defaultdict(list), total_training_steps, -1
+    
         base_dir = f"{self.config.meta_trainer.base_sharedata_data_dir}/" \
                f"{self.config.trainer.project_name}/" \
                f"{self.config.trainer.experiment_name}/augment_history"
         
         if not os.path.exists(base_dir):
             print(f"[Restore] augment_history directory not found: {base_dir}")
-            return defaultdict(list), total_training_steps
+            return defaultdict(list), total_training_steps, -1
 
         # 1. 匹配文件名中的 step 与 outer_loop
         pattern = re.compile(r"global_training_step_(\d+)_outer_loop_(\d+)_augment_history_.*\.jsonl$")
@@ -1931,7 +1935,7 @@ class RayPPOTrainer:
 
         if not records:
             print(f"[Restore] No augment_history files found in {base_dir}")
-            return defaultdict(list), total_training_steps
+            return defaultdict(list), total_training_steps, -1
 
         # 2. 按 step, outer_loop 排序
         records.sort(key=lambda x: (x[0], x[1]))
@@ -1976,6 +1980,13 @@ class RayPPOTrainer:
         
         return history_question2variants, total_training_steps, next_outer_loop
 
+    def _get_kept_batch(self, batch: DataProto, kept_prompt_uids: list[str]) -> DataProto:
+        kept_traj_idxs = []
+        for idx, traj_from_prompt_uid in enumerate(batch.non_tensor_batch["uid"]):
+            if traj_from_prompt_uid in kept_prompt_uids:
+                kept_traj_idxs.append(idx)
+        return batch[kept_traj_idxs]
+    
     def fit(self):
         """
         The training loop of PPO.
@@ -2073,110 +2084,84 @@ class RayPPOTrainer:
                         repeat_times = self.config.actor_rollout_ref.rollout.n
                         new_ori_batch, ori_prompt_uid2metric_mean = self._evaluate_current_batch(ori_batch, repeat_times=repeat_times, metric_name=metric_name) # new_ori_batch 已repeat对齐，ori_batch 未对齐
 
-                        # # 若已达标，跳过增强
-                        # if current_acc >= self.config.meta_trainer.acc_threshold:
-                        #     print("[Meta-Train] Accuracy already meets threshold. Skipping augmentation.")
-                        #     self._standard_ppo_step(ori_batch)
-                        #     break
+                        kept_uid_metrics_ori = [
+                                (uid, metric) for uid, metric in ori_prompt_uid2metric_mean.items() if (metric != 0 and metric != 1)
+                        ]
+                        # ori_batch 中，具有学习信号的样本
+                        global_kept_ori_batch = self._get_kept_batch(new_ori_batch, [uid_metric[0] for uid_metric in kept_uid_metrics_ori])
 
                         # Step 2: 场景增强生成 aug_batch，选出 n_to_augment 个prompt去增强
                         n_to_augment = int(np.ceil(2 / 3 * original_size))
                         # n_to_augment = 50
-                        kept_ori_order_prompt_uids = self._get_tobe_augment_prompt_uids(ori_prompt_uid2metric_mean, n_to_augment)
+                        prompt_uids_kept_ori_order = self._get_tobe_augment_prompt_uids(ori_prompt_uid2metric_mean, n_to_augment)
                         
-                        kept_traj_idxs = []
-                        for idx, traj_from_prompt_uid in enumerate(ori_batch.non_tensor_batch["uid"]):
-                            if traj_from_prompt_uid in kept_ori_order_prompt_uids:
-                                kept_traj_idxs.append(idx)
-                        
-                        tobe_augmented_batch = ori_batch[kept_traj_idxs]
-                        target_size = self.config.meta_trainer.get("target_aug_batch_size", original_size)
+                        tobe_augmented_batch = self._get_kept_batch(ori_batch, prompt_uids_kept_ori_order)
+                        target_size = self.config.meta_trainer.get("target_aug_batch_size", 2*n_to_augment)  # 改成每次生成 2*n_to_augment 个样本，为每个样本生成2个变体
                         # target_size = self.config.meta_trainer.get("target_aug_batch_size", n_to_augment+1)
                         tag_ymd, tag_ymd_hms = datetime.now().strftime('%Y%m%d'), datetime.now().strftime('%Y%m%d_%H%M%S')
                         # generator_raw_output_save_file = f"{self.config.meta_trainer.augment_data_dir}/{self.config.trainer.experiment_name}/generator_raw_output/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/{self.config.meta_trainer.scene_generator.model_name}_raw_output_{tag_ymd_hms}.jsonl"
                         # generator_raw_output_save_file = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/generator_raw_output/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/{self.config.meta_trainer.scene_generator.model_name}_raw_output_{tag_ymd_hms}.jsonl"
+                        
+                        # 一直生成数据，直到 ori_batch 和 aug_batch 里面准确率不全为0和不全为1的样本数达到 train_batch_size
+                        num_valid_prompt_in_batch = len(kept_uid_metrics_ori)
+                        train_bsz = self.config.data.train_batch_size
                         generator_raw_output_save_file = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/generator_raw_output/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}/{self.config.meta_trainer.scene_generator.model_name}_raw_output_{tag_ymd_hms}.jsonl"
-                        
+                        global_kept_aug_batch = None
+                        global_kept_uid_metrics_aug = []
+                        generate_cnt = 0
                         with marked_timer("generate_scene_data", timing_raw):
-                            aug_data_list, history_question2variants = self._generate_augdata_until_target_size(tobe_augmented_batch, target_size, history_question2variants, generator_raw_output_save_file)
-                            # aug_data_list, history_question2variants = self._generate_augdata_until_target_size_sync(tobe_augmented_batch, target_size, history_question2variants, generator_raw_output_save_file)
-                        print(f"[generate scene data cost time] {timing_raw['generate_scene_data']/60} mins")
+                            while num_valid_prompt_in_batch < train_bsz:
+                                generate_cnt += 1
+                                print(f"{num_valid_prompt_in_batch=} < {self.config.data.train_batch_size=}")
+                                print(f"[INFO] Generate Round {generate_cnt}. There are still {train_bsz - num_valid_prompt_in_batch} neet to be generated.")
+                                
+                                aug_data_list, history_question2variants = self._generate_augdata_until_target_size(tobe_augmented_batch, target_size, history_question2variants, generator_raw_output_save_file)
+                                
+                                # 将生成的数据转换成 dataprob 期望的格式并保存成 jsonl 文件（方便查看）和 parquet 文件（方便RLHFDataset接口加载）
+                                converted_aug_data_list = self._convert_to_experted_data_format(aug_data_list)
+                                aug_data_save_dir = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/parsed_and_converted_data/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
+                                # aug_data_save_dir = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/parsed_and_converted_data/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
+                                parquet_path = self._save_data_to_jsonl_and_parquet(converted_aug_data_list, aug_data_save_dir)
+
+                                aug_dataloader = self._create_temp_dataloader_from_path(parquet_path, len(converted_aug_data_list))
+                                aug_batch = DataProto.from_single_dict(next(iter(aug_dataloader)))
+
+                                # 评估aug_batch，计算每个prompt的准确率
+                                aug_batch.non_tensor_batch["uid"] = np.array(
+                                    [str(uuid.uuid4()) for _ in range(len(aug_batch.batch))], dtype=object
+                                )
+                                metric_name = "acc"
+                                new_aug_batch, aug_prompt_uid2metric_mean = self._evaluate_current_batch(aug_batch, repeat_times=repeat_times, metric_name=metric_name)
+
+                                kept_aug_uid_metrics = [
+                                    (uid, metric) for uid, metric in aug_prompt_uid2metric_mean.items() if (metric != 0 and metric != 1)
+                                ]
+                                global_kept_uid_metrics_aug.extend(kept_aug_uid_metrics)
+                                num_valid_prompt_in_batch += len(kept_aug_uid_metrics)
+                                print(f"[INFO] Generate Round {generate_cnt}. There are {len(kept_aug_uid_metrics)} samples being kept.")
+
+                                # 逐步缩小 target_size，逐步收敛，防止冗余生成
+                                target_size = (self.config.data.train_batch_size - num_valid_prompt_in_batch) * 2 # 这里有点难收敛
+                                # 选出这些有效的样本id
+                                kept_aug_batch = self._get_kept_batch(new_aug_batch, [uid_metric[0] for uid_metric in kept_aug_uid_metrics])
+                                global_kept_aug_batch = kept_aug_batch if global_kept_aug_batch is None else DataProto.concat([global_kept_aug_batch, kept_aug_batch])
                         
+                        print(f"[Augmentation End] Generated {len(aug_data_list)} augmented samples.")
+                        print(f"[Generate scene data cost time] {timing_raw['generate_scene_data']/60} mins")
                         # TODO: save history_question2variants
-                        # save_file = f"{self.config.meta_trainer.base_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_history/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
-                        # save_file = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_history/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.jsonl"
+                        # 生成完后再保存
                         save_file = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_history/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}_augment_history_{tag_ymd_hms}.json"
                         # TODO: 写一个通用的保存字典到文件的函数
                         self._save_dict_to_json(history_question2variants, save_file)
-                        print(f"[Augmentation End] Generated {len(aug_data_list)} augmented samples.")
-                        
-                        # 将生成的数据转换成 dataprob 期望的格式并保存成 jsonl 文件（方便查看）和 parquet 文件（方便RLHFDataset接口加载）
-                        converted_aug_data_list = self._convert_to_experted_data_format(aug_data_list)
-                        # aug_data_save_dir = f"{self.config.meta_trainer.augment_data_dir}/{self.config.trainer.experiment_name}/parsed_and_converted_data/{tag_ymd}/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
-                        aug_data_save_dir = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/parsed_and_converted_data/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
-                        # aug_data_save_dir = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/augment_data/parsed_and_converted_data/global_training_step_{self.global_steps}_outer_loop_{outer_loop_idx}"
-                        parquet_path = self._save_data_to_jsonl_and_parquet(converted_aug_data_list, aug_data_save_dir)
 
-                        aug_dataloader = self._create_temp_dataloader_from_path(parquet_path, len(converted_aug_data_list))
-                        aug_batch = DataProto.from_single_dict(next(iter(aug_dataloader)))
-
-                        # Step 3: 构造增强后的训练 batch
-                        # TODO: 可提供多种策略
-                        # strategy = self.config.meta_trainer.augmentation_strategy
-
-                        # 评估aug_batch，计算每个prompt的准确率
-                        aug_batch.non_tensor_batch["uid"] = np.array(
-                            [str(uuid.uuid4()) for _ in range(len(aug_batch.batch))], dtype=object
-                        )
-                        metric_name = "acc"
-                        new_aug_batch, aug_prompt_uid2metric_mean = self._evaluate_current_batch(aug_batch, repeat_times=repeat_times, metric_name=metric_name)
-
-                        # 把两个batch合起来，然后用 ModifiedGaussian 根据每个prompt的错误率映射到采样概率，然后采出train_batch_size个prompt作为训练集
-                        concat_batch = DataProto.concat([new_ori_batch, new_aug_batch])
-                        merged_prompt_uid2metric_mean = {**ori_prompt_uid2metric_mean, **aug_prompt_uid2metric_mean}  # ori_prompt_uid2metric_mean | aug_prompt_uid2metric_mean
-                        prompt_uids = list(merged_prompt_uid2metric_mean.keys())
-                        acc = np.array(list(merged_prompt_uid2metric_mean.values()))
-                        wrong_rate = 1 - acc
-
-                        # 初始化修正型高斯函数（参数可按需调整）以x0为中心，k调整锐度，c是错误率为1对应的采样概率
-                        map_func = ModifiedGaussian(x0=0.5, c=0.1, k=20)
-                        sample_probs = wrong_rate2sample_probs(map_func, wrong_rate) # 映射后要归一化
+                        # 把两个batch合起来作为训练集
+                        concat_batch = DataProto.concat([global_kept_ori_batch, global_kept_aug_batch])
                         train_bsz = self.config.data.train_batch_size
-                        non_zero_cnt = (sample_probs != 0).sum()
-                        chosen_prompt_uids = random.choice(prompt_uids, size=min(train_bsz, non_zero_cnt), replace=False, p=sample_probs)
-                        chosen_traj_idxs = []
-                        for idx, traj_from_prompt_uid in enumerate(concat_batch.non_tensor_batch["uid"]):
-                            if traj_from_prompt_uid in chosen_prompt_uids:
-                                chosen_traj_idxs.append(idx)
-                        train_batch = concat_batch[chosen_traj_idxs]
-                        
-                        if non_zero_cnt < train_bsz: # 248 vs 256
-                            if train_bsz - non_zero_cnt <= train_bsz // 4:
-                                # 从 chosen_prompt_uids 中采样
-                                # additional_prompt_uids = [chosen_prompt_uids[random.randint(0, len(chosen_prompt_uids))] for _ in range(train_bsz - non_zero_cnt)]
-                                additional_prompt_uids = random.choice(chosen_prompt_uids, size=train_bsz-non_zero_cnt, replace=False)
-                            else: 
-                                # 远小于 train_bsz，从 prompt_uids 中采样   这里要再优化一下，现在的做法会导致additional_prompt_ids有id重复
-                                # additional_prompt_uids = [prompt_uids[random.randint(0, len(prompt_uids))] for _ in range(train_bsz - non_zero_cnt)]
-                                additional_prompt_uids = random.choice(prompt_uids, size=train_bsz-non_zero_cnt, replace=False)
-                            
-                            additional_traj_idxs = []
-                            for idx, traj_from_prompt_uid in enumerate(concat_batch.non_tensor_batch["uid"]):
-                                if traj_from_prompt_uid in additional_prompt_uids:
-                                    additional_traj_idxs.append(idx)
-                            train_batch = DataProto.concat([train_batch, concat_batch[additional_traj_idxs]])
-
-                        # 这里会有问题：可能有重复的uid，超过了group_size，导致后面group-based adv估计出错。
-                        # 所以需要重新分配uid，每 rollout.n 条轨迹分配一个新的uid
-                        assert len(train_batch.batch) % self.config.actor_rollout_ref.rollout.n == 0
-                        sample_cnt = len(train_batch.batch) // self.config.actor_rollout_ref.rollout.n
-                        new_uids = np.array([str(uuid.uuid4()) for _ in range(sample_cnt)], dtype=object)
-                        train_batch.non_tensor_batch["uid"] = np.repeat(new_uids, repeat_times, axis=0)
+                        real_train_bsz = train_bsz * self.config.actor_rollout_ref.rollout.n
+                        train_batch = concat_batch[:real_train_bsz]
+                        uid_metrics_train_batch = (kept_uid_metrics_ori + kept_uid_metrics_ori)[:train_bsz]
 
                         # dump actual training data
-                        # train_data_output_path = f"{self.config.meta_trainer.training_data_dir}/{self.config.trainer.experiment_name}/{tag_ymd}/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
-                        # train_data_output_path = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/actual_training_data/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
-                        # train_data_output_path = f"{self.config.meta_trainer.base_sharedata_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/actual_training_data/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
                         train_data_output_path = f"{self.config.meta_trainer.base_workspace_data_dir}/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/actual_training_data/global_step_{self.global_steps}_outer_loop_{outer_loop_idx}_{tag_ymd_hms}.jsonl"
                         self._save_dataproto_to_jsonl(train_batch, train_data_output_path, one_id_saved_once=True)
 
@@ -2185,9 +2170,9 @@ class RayPPOTrainer:
                         metrics = self._standard_ppo_step(train_batch, metrics, timing_raw, True)
                         print(f"metrics after ppo training: {metrics}")
 
-                        overall_mean_acc = acc.mean()  # 提前计算，早停判断，修正总训练步数
+                        train_mean_acc = np.array([uid_metric[1] for uid_metric in uid_metrics_train_batch]).mean()  # 提前计算，早停判断，修正总训练步数
                         exit_threshold = self.config.meta_trainer.acc_threshold
-                        is_early_exit = self._is_early_exit(overall_mean_acc, exit_threshold)
+                        is_early_exit = self._is_early_exit(train_mean_acc, exit_threshold)
                         if is_early_exit:
                             print(f"Early stopping at step {self.global_steps} for batch {batch_idx}")
                             namespace = "loop_repeat"
@@ -2318,10 +2303,4 @@ class RayPPOTrainer:
                     
                     # Step 5: 早停判断，先用上一步的结果进行判断
                     if is_early_exit: # 如果整体准确率大于0.9，则跳出外层
-                        # TODO，记录提前退出事件
-                        # print(f"Early stopping at step {self.global_steps-1} for batch {batch_idx}")
-                        # loop_metrics = {
-                        #     f"{namespace}/early_stop_at_step": outer_loop_idx,
-                        # }
-                        # logger.log(data=loop_metrics, step=self.global_steps-1) # 注意：此时 global_steps 已 +1，日志用上一步的 step
                         break  # 退出 outer_loop_repeat，继续下一个 batch
