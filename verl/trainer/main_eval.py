@@ -28,11 +28,13 @@ from tqdm import tqdm
 from verl.trainer.ppo.reward import get_custom_reward_fn
 from verl.utils.fs import copy_to_local
 
+def safe_iloc(obj, idx, default=None):
+    return obj.iloc[idx] if obj is not None else default
 
 @ray.remote
-def process_item(reward_fn, data_source, response_lst, reward_data):
+def process_item(reward_fn, data_source, response_lst, reward_data, extra_info=None):
     ground_truth = reward_data["ground_truth"]
-    score_lst = [reward_fn(data_source, r, ground_truth) for r in response_lst]
+    score_lst = [reward_fn(data_source, r, ground_truth, extra_info) for r in response_lst]
     # print(f"Data source: {data_source}, Score list: {score_lst}")
     return data_source, np.mean(score_lst)
 
@@ -41,10 +43,11 @@ def process_item(reward_fn, data_source, response_lst, reward_data):
 def main(config):
     local_path = copy_to_local(config.data.path, use_shm=config.data.get("use_shm", False))
     dataset = pd.read_parquet(local_path)
-    print(dataset.head())
+    # print(dataset.head())
     responses = dataset[config.data.response_key]
     data_sources = dataset[config.data.data_source_key]
     reward_model_data = dataset[config.data.reward_model_key]
+    extra_info = dataset.get("extra_info", None)
     # print(data_sources)
     # print("#"*50)
     # print(reward_model_data)
@@ -60,7 +63,7 @@ def main(config):
 
     # Create remote tasks
     remote_tasks = [
-        process_item.remote(compute_score, data_sources.iloc[i], responses.iloc[i], reward_model_data.iloc[i]) for i in range(total)
+        process_item.remote(compute_score, data_sources.iloc[i], responses.iloc[i], reward_model_data.iloc[i], safe_iloc(extra_info, i)) for i in range(total)
     ]
 
     # Process results as they come in
