@@ -44,10 +44,12 @@ def default_compute_score(
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
-    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
+    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:  # 这些数据集都用优化的答案提取逻辑来处理
         from . import math
+        from . import aug_gsm8k
 
-        res = math.compute_score(solution_str, ground_truth)
+        # res = math.compute_score(solution_str, ground_truth)
+        res = aug_gsm8k.compute_score(solution_str, ground_truth, return_dict=False)
         # [Optional] Math-Verify Integration
         # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
         # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.
@@ -102,6 +104,9 @@ def default_compute_score(
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
+    elif data_source in ["Hothan/OlympiadBench"]:
+        from . import olympiad
+        res = olympiad.compute_score(solution_str, ground_truth, extra_info, return_dict=False)
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 

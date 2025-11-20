@@ -482,7 +482,8 @@ def compute_score(
     ground_truth: str,
     strict_box_verify: bool = True,
     pause_tokens_index: Optional[list[int]] = None,
-    use_last_number: bool = True
+    use_last_number: bool = True,
+    return_dict: bool = True
 ) -> float:
     """Compute the reward score for a solution.
 
@@ -504,8 +505,11 @@ def compute_score(
     reward = 1.0 if correct else -1.0
     acc = correct
 
-    return {
-        "score": reward,
-        "acc": acc,
-        "pred": pred,
-    }
+    if return_dict:
+        return {
+            "score": reward,
+            "acc": acc,
+            "pred": pred,
+        }
+    else:  # 用于 main_eval
+        return 1.0 if correct else 0.0
